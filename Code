@@ -1,0 +1,231 @@
+name: Build Package Branch
+
+on:
+  workflow_call:
+    inputs:
+      runner-size:
+        type: string
+        default: "large"
+        required: false
+        description: "The runner size (cpu/memory); possible values: small, medium, large"
+      root-folder:
+        type: string
+        required: true
+        description: "Root folder containing the build.xml file"
+      sonar-project-key:
+        type: string
+        required: true
+        description: "Key of the Sonar project. e.g. LAA_K03_NC_Corporate_Banking"
+      whitesource-config-file-location:
+        type: string
+        required: false
+        default: whitesource-fs-agent.config
+        description: "Location of the whitesource config file"
+      whitesource-enabled:
+        type: boolean
+        required: false
+        default: false
+        description: "If true, run a Whitesource scan."
+      generate-release-notes:
+        type: boolean
+        required: false
+        default: true
+        description: "When 'true', a Release with release notes will be generated after each release."
+      java-version:
+        type: string
+        required: false
+        default: '17'
+        description: "Java version to use to build the library."
+      checkmarx-enabled:
+        type: boolean
+        required: false
+        default: false
+        description: "Enables Checkmarx scanning on your code."
+      codeql-enabled:
+        type: boolean
+        required: false
+        default: false
+        description: "If true, then a CodeQL scan will be performed."
+
+jobs:
+  calculate-versions:
+    runs-on: ["sofa_default", "size_small"]
+    permissions:
+      contents: read
+
+    outputs:
+      latest_tag: ${{ steps.next-versions.outputs.latest_tag }}
+      new_tag: ${{ steps.next-versions.outputs.new_tag }}
+      year: ${{ steps.version-on-current-release-branch.outputs.year }}
+      month: ${{ steps.version-on-current-release-branch.outputs.month }}
+
+    steps:
+    - name: Verify source branch
+      if: ${{ ! startsWith(github.ref, 'refs/heads/master') }}
+      run: |
+        echo "::error::You can only release from the master branch. Please select the correct branch."
+        exit 1
+
+    - name: Checkout master branch
+      uses: actions/checkout@v4
+      with:
+        ref: master
+
+    - name: Validate Ant project
+      run: |
+        if [ ! -f "${{ inputs.root-folder }}/build.xml" ]; then
+          echo "::error::Ant build file (build.xml) is required to create artifacts."
+          exit 1
+        fi
+
+    - name: Get current snapshot version from master branch
+      id: version-on-master
+      run: |
+        version=$(xmllint --xpath "string(//project/property[@name='version']/@value)" "${{ inputs.root-folder }}/build.xml")
+        echo "::debug::version: $version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Switch back to branch to release from
+      uses: actions/checkout@v4
+
+    - name: Get current version from release branch
+      id: version-on-current-release-branch
+      run: |
+        version=$(xmllint --xpath "string(//project/property[@name='version']/@value)" "${{ inputs.root-folder }}/build.xml")
+        echo "::debug::version: $version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout master with PAT for tagging
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+
+    - name: Calculate latest and next tag
+      id: next-versions
+      run: |
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "Latest tag: $latest_tag"
+
+        IFS='.' read -r major minor patch <<< "${latest_tag#v}"
+        new_patch=$((patch + 1))
+        new_tag="v$major.$minor.$new_patch"
+
+        echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+        echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+
+  build-package-branch:
+    needs: calculate-versions
+    runs-on: ["sofa_default", "size_${{ inputs.runner-size }}"]
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+
+    steps:
+    - name: Check required tools
+      run: |
+        command -v ant || { echo "::error::Ant not found"; exit 1; }
+        command -v java || { echo "::error::Java not found"; exit 1; }
+        command -v xmllint || { echo "::error::xmllint not found"; exit 1; }
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: ${{ inputs.java-version }}
+
+    - name: Fetch global configuration
+      id: global-configuration
+      uses: kbcgroup/y4g_composite_fetch_configuration@v2
+
+    - name: Fetch secrets
+      id: fetch_token
+      uses: kbcgroup/y4g_action_fetch_secret@v1
+      with:
+        sofa: 'genericcicd'
+        secret: 'privileged-token'
+        scope: 'repo'
+        output: PAT
+        endpoint: '${{ vars.SECRET_ENDPOINT }}'
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ steps.fetch_token.outputs.PAT }}
+
+    - name: Initialize Ivy
+      run: |
+        mkdir -p ~/.ivy2
+        cp "${{ inputs.root-folder }}/ivy.xml" ~/.ivy2/ivy.xml || true
+
+    - if: ${{ inputs.codeql-enabled }}
+      name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: java
+        queries: security-extended,security-and-quality
+
+    - name: Fetch Codetables
+      uses: kbcgroup/y9o_composite_codetables@master
+      continue-on-error: true
+
+    - name: Update version in build.xml
+      env:
+        NEXT_RELEASE_VERSION: ${{ needs.calculate-versions.outputs.new_tag }}
+      run: |
+        sed -i "s/<property name=\"version\" value=\"[^\"]*\"\/>/\1${NEXT_RELEASE_VERSION}\2/" "${{ inputs.root-folder }}/build.xml"
+
+    - name: Build and verify with Ant
+      run: ant -f "${{ inputs.root-folder }}/build.xml" clean compile
+
+    - name: Check for uncommitted tracked changes
+      id: git-changes-release
+      uses: kbcgroup/y4g_composite_has_changes@v1
+      with:
+        status-args: '--untracked-files=no'
+
+    - if: ${{ steps.git-changes-release.outputs.changed == '1' }}
+      name: Commit release version change
+      run: |
+        git config user.name "github-actions"
+        git config user.email "github-actions@github.com"
+        git commit -am "Version ${{ needs.calculate-versions.outputs.new_tag }}"
+
+    - name: Tag release version
+      run: |
+        git tag -fa "${{ needs.calculate-versions.outputs.new_tag }}" -m "Tagging version ${{ needs.calculate-versions.outputs.new_tag }} (branch:${{ github.ref_name }})"
+
+    - name: Push release changes + release tag
+      run: |
+        git push origin
+        git push origin --tags
+
+    - name: Build and release with Ant
+      run: ant -f "${{ inputs.root-folder }}/build.xml" clean deploy -DskipTests=true -Dcopy.${{ inputs.root-folder }}.local=true -D${{ inputs.root-folder }}.git=true
+
+    - name: Sonar scan
+      uses: kbcgroup/y4g_composite_sonar_scan@v1
+      with:
+        meta-system: ${{ steps.global-configuration.outputs.meta-system }}
+        sonar-url: ${{ vars.SONAR_ENDPOINT }}
+        sonar-project-key: ${{ inputs.sonar-project-key }}
+        scanner: ant
+
+    - if: ${{ inputs.checkmarx-enabled }}
+      name: Checkmarx scan
+      uses: kbcgroup/y4g_composite_checkmarx_scan@v2
+      with:
+        cx_url: ${{ vars.CHECKMARX_ENDPOINT }}
+        secret_endpoint_url: ${{ vars.SECRET_ENDPOINT }}
+        break_build: false
+        zip_exclude: '\\.git\\/.*,\\.github\\/.*,.*\\.jar,.*\\.war,.*\\.tar,.*\\.gz,.*\\.aar,dexguard\\/.*,target\\/.*,\\.scannerwork\\/.*,\\.gitignore\\/.*,\\.idea\\/.*,dependencies-lock\\.json'
+
+    - if: ${{ inputs.whitesource-enabled }}
+      name: Whitesource Scan
+      uses: kbcgroup/y4g_composite_whitesource_scan@v2
+      with:
+        wssURL: ${{ vars.WHITESOURCE_ENDPOINT }}
+        secretEndpointUrl: ${{ vars.SECRET_ENDPOINT }}
+        configFile: ${{ inputs.whitesource-config-file-location }}
